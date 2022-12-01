@@ -4,46 +4,85 @@
 #include "imports/constants.fc";
 #include "imports/utils.fc";
 
-;; int min_gas_amount() asm "1000000000 PUSHINT"; ;; 1 TON
+int min_gas_amount() asm "1000000000 PUSHINT"; ;; 1 TON
+int flags_on() asm "0 PUSHINT";
 
-(slice, slice, slice, slice, slice, int, cell) load_data() inline {
+;; (slice, int) load_data() inline {
+;;   var ds = get_data().begin_parse();
+;;   return 
+;;     (ds~load_msg_addr(), ;; marketplace_address 
+;;       ds~load_msg_addr(), ;; nft_address1
+;;       ds~load_msg_addr(),  ;; nft_owner_address1
+;;       ds~load_msg_addr(), ;; nft_address2
+;;       ds~load_msg_addr(),  ;; nft_owner_address2
+;;       ;; ds~load_coins(), ;; full_price
+;;       ds~load_uint(2) ;; flags
+;;       ;; ds~load_ref() ;; fees_cell
+;;      );
+;; }
+
+(slice, int, cell, cell ) load_data() inline {
   var ds = get_data().begin_parse();
   return 
-    (ds~load_msg_addr(), ;; marketplace_address 
-      ds~load_msg_addr(), ;; nft_address1
-      ds~load_msg_addr(),  ;; nft_owner_address1
-      ds~load_msg_addr(), ;; nft_address2
-      ds~load_msg_addr(),  ;; nft_owner_address2
-      ;; ds~load_coins(), ;; full_price
-      ds~load_uint(2), ;; flags
-      ds~load_ref() ;; fees_cell
+    (ds~load_msg_addr(),
+      ds~load_uint(2),
+       ;; marketplace_address 
+      ds~load_ref(), ;; user1
+      ds~load_ref() ;; user2
+       ;; flags
+      ;; ds~load_ref() ;; fees_cell
      );
 }
 
-(int, slice, int) load_fees(cell fees_cell) inline {
-  var ds = fees_cell.begin_parse();
-  return 
-    (ds~load_coins(), ;; marketplace_fee,
-      ds~load_msg_addr(), ;; royalty_address 
-      ds~load_coins() ;; royalty_amount
-     );
+cell load_user1() inline {
+  var ds = get_data().begin_parse();
+
+    ds~load_msg_addr(); ;; marketplace_address 
+    ds~load_uint(2);
+   return    ds~load_ref(); ;; user1
+     
 }
 
+int load_flags() inline {
+  var ds = get_data().begin_parse();
+  ds~load_msg_addr();
+  return ds~load_uint(2);
+}
 
-() save_data(slice marketplace_address, slice nft_address1, slice nft_owner_address1, slice nft_address2, slice nft_owner_address2, cell fees_cell) impure inline {
+;; (int, slice, int) load_fees(cell fees_cell) inline {
+;;   var ds = fees_cell.begin_parse();
+;;   return 
+;;     (ds~load_coins(), ;; marketplace_fee,
+;;       ds~load_msg_addr(), ;; royalty_address 
+;;       ds~load_coins() ;; royalty_amount
+;;      );
+;; }
+
+
+() save_data(slice marketplace_address, cell user1, cell user2, int flags) impure inline {
   set_data(begin_cell()
     .store_slice(marketplace_address)
-    .store_slice(nft_address1)
-    .store_slice(nft_owner_address1)
-    .store_slice(nft_address2)
-    .store_slice(nft_owner_address2)
-    ;; .store_coins(full_price)
     .store_uint(flags, 2)
-    .store_ref(fees_cell)
+    .store_ref(user1)
+    .store_ref(user2)
+    ;; .store_coins(full_price)
+    ;; .store_ref(fees_cell)
     .end_cell());
 }
 
-() swap( slice marketplace_address, slice nft_address1, slice nft_owner_address1, slice nft_address2, slice nft_owner_address2,  int query_id) impure {
+cell build_user_cell(slice nft_address, slice owner_address) inline {
+  return begin_cell().store_slice(nft_address).store_slice(owner_address).end_cell();
+}
+
+(slice, slice) get_addresses(cell user) inline {
+  var ds = user.begin_parse();
+  return (
+    ds~load_msg_addr(), ;; nft
+    ds~load_msg_addr()  ;; owner
+  );
+}
+
+() swap_nft( slice marketplace_address, slice nft_address1, slice nft_owner_address1, slice nft_address2, slice nft_owner_address2,  int query_id) impure {
   ;; throw_unless(450, msg_value >= full_price + min_gas_amount());
 
   ;; var (marketplace_fee, royalty_address, royalty_amount) = load_fees(fees_cell);
@@ -100,8 +139,20 @@
            .store_int(0, 1) ;; empty custom_payload
            .store_coins(0) ;; forward amount to new_owner_address
            .store_int(0, 1); ;; empty forward_payload
-  send_raw_message(nft_msg1.end_cell(), 128 + 32);
+  send_raw_message(nft_msg1.end_cell(), 1);
+
+  [int balance, _ ] = get_balance();
+
+  var marketplace_msg = begin_cell()
+		   .store_uint(0x10, 6) ;; nobounce
+		   .store_slice(marketplace_address)
+		   .store_coins(balance)
+		   .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+  send_raw_message(marketplace_msg.end_cell(), 128 + 32);
 }
+
+
 
 () recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
     slice cs = in_msg_full.begin_parse();
@@ -113,7 +164,11 @@
 
     slice sender_address = cs~load_msg_addr();
 
-    var(marketplace_address, nft_address1, nft_owner_address1, nft_address2, flags, fees_cell) = get_data();
+    var (marketplace_address, _, user1, user2 ) = load_data();
+    int flags = load_flags();
+    ~dump (flags);
+    var (nft_address1, nft_owner_address1) = get_addresses(user1);
+    var (nft_address2, nft_owner_address2) = get_addresses(user2);
 
     if (in_msg_body.slice_empty?()) {
         ;; buy(my_balance, marketplace_address, nft_address, nft_owner_address, full_price, fees_cell, msg_value, sender_address, 0);
@@ -122,6 +177,14 @@
 
     int op = in_msg_body~load_uint(32);
     int query_id = in_msg_body~load_uint(64);
+
+    if (op == 2) {
+      ;; slice nft_address1 = in_msg_body~load_msg_addr();
+      ;; slice nft_owner_address1 = in_msg_body~load_msg_addr();
+      ;; slice nft_address2 = in_msg_body~load_msg_addr();
+      ;; slice nft_owner_address2 = in_msg_body~load_msg_addr();
+      ;; save_data(marketplace_address,nft_address1,nft_owner_address1,nft_address2,nft_owner_address2,0);
+    }
 
 
     if (op == 3) { ;; cancel sale
@@ -157,43 +220,76 @@
               .store_coins(0) ;; forward amount to new_owner_address
               .store_int(0, 1); ;; empty forward_payload
 
-            send_raw_message(msg2.end_cell(), 128 + 32);
+            send_raw_message(msg2.end_cell(), 1);
         }
+        [int balance, _ ] = get_balance();
+        var marketplace_msg = begin_cell()
+          .store_uint(0x10, 6) ;; nobounce
+          .store_slice(marketplace_address)
+          .store_coins(balance)
+          .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+        send_raw_message(marketplace_msg.end_cell(), 128 + 32);
         return ();
     }
-
-    if (op == ownership_assigned()){
+    ;; ~dump (op);
+    
+    if (op == op::ownership_assigned()){
       if (equal_slices(sender_address, nft_address1)){
-        if(flags & 2){
+        if( flags & 2){
           ;; save_data(marketplace_address, nft_address1, nft_owner_address1, nft_address2, 3, fees_cell);
-          swap(marketplace_address, nft_address1, nft_owner_address1, nft_address2, nft_owner_address2, query_id);
-          
+          swap_nft(marketplace_address, nft_address1, nft_owner_address1, nft_address2, nft_owner_address2, query_id);
+          ~dump (15);
+          ~dump (flags);
+          return ();
         } else {
-          save_data(marketplace_address, nft_address1, nft_owner_address1, nft_address2, 1, fees_cell);
+          save_data(marketplace_address, user1, user2, 1);
+          ~dump (5);
+          ~dump (flags);
           return ();
         }
       }
       if (equal_slices(sender_address, nft_address2)){
         if(flags & 1){
           ;; save_data(marketplace_address, nft_address1, nft_owner_address1, nft_address2, 3, fees_cell);
-          swap(marketplace_address, nft_address1, nft_owner_address1, nft_address2, nft_owner_address2, query_id);
+          swap_nft(marketplace_address, nft_address1, nft_owner_address1, nft_address2, nft_owner_address2, query_id);
+          ~dump (3);
+          ~dump (flags);
+          return ();
         } else {
-          save_data(marketplace_address, nft_address1, nft_owner_address1, nft_address2, 2, fees_cell);
+          save_data(marketplace_address, user1, user2, 2);
+          ~dump (4);
+          ~dump (flags);
           return ();
         }
       }
-
+    throw(0xaaaa);
     }
 
     throw(0xffff);
+    ;; return ();
     
 }
 
 () recv_external(slice in_msg) impure {
 }
 
-(slice, slice, slice, slice, slice, int, cell) get_swap_data() method_id {
+int meaning_of_life() method_id {
+  return 42;
+}
+
+slice get_swap_data() method_id {
   ;; var (marketplace_address, nft_address, nft_owner_address, full_price, fees_cell) = load_data();
   ;; var (marketplace_fee, royalty_address, royalty_amount) = load_fees(fees_cell);
-  return load_data();
+  (slice addr, _, _, _) = load_data();
+  return addr;
 }
+
+slice get_nft1() method_id {
+  (var nft1, _) = get_addresses(load_user1());
+  return nft1;
+}
+
+int get_flags() method_id {
+  return load_flags();
+} 
